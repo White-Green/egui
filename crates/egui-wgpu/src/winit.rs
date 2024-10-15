@@ -86,7 +86,7 @@ pub struct Painter {
     depth_format: Option<wgpu::TextureFormat>,
     screen_capture_state: Option<CaptureState>,
 
-    instance: wgpu::Instance,
+    instance: Arc<wgpu::Instance>,
     render_state: Option<RenderState>,
 
     // Per viewport/window:
@@ -114,10 +114,15 @@ impl Painter {
         depth_format: Option<wgpu::TextureFormat>,
         support_transparent_backbuffer: bool,
     ) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: configuration.supported_backends,
-            ..Default::default()
-        });
+        let instance = configuration.renderer.as_ref().map_or_else(
+            || {
+                Arc::new(wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: configuration.supported_backends,
+                    ..Default::default()
+                }))
+            },
+            |r| Arc::clone(&r.instance),
+        );
 
         Self {
             configuration,

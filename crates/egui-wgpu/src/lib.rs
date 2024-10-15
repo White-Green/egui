@@ -59,13 +59,6 @@ pub struct RenderState {
     /// Wgpu adapter used for rendering.
     pub adapter: Arc<wgpu::Adapter>,
 
-    /// All the available adapters.
-    ///
-    /// This is not available on web.
-    /// On web, we always select WebGPU is available, then fall back to WebGL if not.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub available_adapters: Arc<[wgpu::Adapter]>,
-
     /// Wgpu device used for rendering, created from the adapter.
     pub device: Arc<wgpu::Device>,
 
@@ -93,62 +86,86 @@ impl RenderState {
     ) -> Result<Self, WgpuError> {
         crate::profile_scope!("RenderState::create"); // async yield give bad names using `profile_function`
 
-        // This is always an empty list on web.
-        #[cfg(not(target_arch = "wasm32"))]
-        let available_adapters = instance.enumerate_adapters(wgpu::Backends::all());
-
-        let adapter = {
-            crate::profile_scope!("request_adapter");
-            instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: config.power_preference,
-                    compatible_surface: Some(surface),
-                    force_fallback_adapter: false,
-                })
-                .await
-                .ok_or_else(|| {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if available_adapters.is_empty() {
-                        log::info!("No wgpu adapters found");
-                    } else if available_adapters.len() == 1 {
-                        log::info!(
-                            "The only available wgpu adapter was not suitable: {}",
-                            adapter_info_summary(&available_adapters[0].get_info())
-                        );
-                    } else {
-                        log::info!(
-                            "No suitable wgpu adapter found out of the {} available ones: {}",
-                            available_adapters.len(),
-                            describe_adapters(&available_adapters)
-                        );
-                    }
-
-                    WgpuError::NoSuitableAdapterFound
-                })?
-        };
-
-        #[cfg(target_arch = "wasm32")]
-        log::debug!(
-            "Picked wgpu adapter: {}",
-            adapter_info_summary(&adapter.get_info())
-        );
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if available_adapters.len() == 1 {
-            log::debug!(
-                "Picked the only available wgpu adapter: {}",
-                adapter_info_summary(&adapter.get_info())
-            );
+        let adapter;
+        let device;
+        let queue;
+        if let Some(RendererCreation {
+            adapter: a,
+            device: d,
+            queue: q,
+            ..
+        }) = &config.renderer
+        {
+            adapter = Arc::clone(a);
+            device = Arc::clone(d);
+            queue = Arc::clone(q);
         } else {
-            log::info!(
-                "There were {} available wgpu adapters: {}",
-                available_adapters.len(),
-                describe_adapters(&available_adapters)
-            );
+            // This is always an empty list on web.
+            #[cfg(not(target_arch = "wasm32"))]
+            let available_adapters = instance.enumerate_adapters(wgpu::Backends::all());
+
+            adapter = {
+                crate::profile_scope!("request_adapter");
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: config.power_preference,
+                        compatible_surface: Some(surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .map(Arc::new)
+                    .ok_or_else(|| {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if available_adapters.is_empty() {
+                            log::info!("No wgpu adapters found");
+                        } else if available_adapters.len() == 1 {
+                            log::info!(
+                                "The only available wgpu adapter was not suitable: {}",
+                                adapter_info_summary(&available_adapters[0].get_info())
+                            );
+                        } else {
+                            log::info!(
+                                "No suitable wgpu adapter found out of the {} available ones: {}",
+                                available_adapters.len(),
+                                describe_adapters(&available_adapters)
+                            );
+                        }
+
+                        WgpuError::NoSuitableAdapterFound
+                    })?
+            };
+
+            #[cfg(target_arch = "wasm32")]
             log::debug!(
                 "Picked wgpu adapter: {}",
                 adapter_info_summary(&adapter.get_info())
             );
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if available_adapters.len() == 1 {
+                log::debug!(
+                    "Picked the only available wgpu adapter: {}",
+                    adapter_info_summary(&adapter.get_info())
+                );
+            } else {
+                log::info!(
+                    "There were {} available wgpu adapters: {}",
+                    available_adapters.len(),
+                    describe_adapters(&available_adapters)
+                );
+                log::debug!(
+                    "Picked wgpu adapter: {}",
+                    adapter_info_summary(&adapter.get_info())
+                );
+            }
+
+            (device, queue) = {
+                crate::profile_scope!("request_device");
+                adapter
+                    .request_device(&(*config.device_descriptor)(&adapter), None)
+                    .await
+                    .map(|(device, queue)| (Arc::new(device), Arc::new(queue)))?
+            };
         }
 
         let capabilities = {
@@ -157,21 +174,12 @@ impl RenderState {
         };
         let target_format = crate::preferred_framebuffer_format(&capabilities)?;
 
-        let (device, queue) = {
-            crate::profile_scope!("request_device");
-            adapter
-                .request_device(&(*config.device_descriptor)(&adapter), None)
-                .await?
-        };
-
         let renderer = Renderer::new(&device, target_format, depth_format, msaa_samples);
 
         Ok(Self {
-            adapter: Arc::new(adapter),
-            #[cfg(not(target_arch = "wasm32"))]
-            available_adapters: available_adapters.into(),
-            device: Arc::new(device),
-            queue: Arc::new(queue),
+            adapter,
+            device,
+            queue,
             target_format,
             renderer: Arc::new(RwLock::new(renderer)),
         })
@@ -242,6 +250,16 @@ pub struct WgpuConfiguration {
 
     /// Callback for surface errors.
     pub on_surface_error: Arc<dyn Fn(wgpu::SurfaceError) -> SurfaceErrorAction>,
+
+    pub renderer: Option<RendererCreation>,
+}
+
+#[derive(Clone)]
+pub struct RendererCreation {
+    pub instance: Arc<wgpu::Instance>,
+    pub adapter: Arc<wgpu::Adapter>,
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
 }
 
 impl std::fmt::Debug for WgpuConfiguration {
@@ -253,6 +271,7 @@ impl std::fmt::Debug for WgpuConfiguration {
             desired_maximum_frame_latency,
             power_preference,
             on_surface_error: _,
+            renderer: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("supported_backends", &supported_backends)
@@ -310,6 +329,8 @@ impl Default for WgpuConfiguration {
                 }
                 SurfaceErrorAction::SkipFrame
             }),
+
+            renderer: None,
         }
     }
 }
